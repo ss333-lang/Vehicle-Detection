@@ -3,44 +3,61 @@
 The region of interest (ROI) is trimmed to the vehicle body area:
 top and bottom fractions are discarded to avoid roof reflections
 and road/tyre pixels, leaving the painted bodywork for sampling.
+
+CLAHE (Contrast Limited Adaptive Histogram Equalization) is applied
+to the Value channel before matching so that colours detected under
+different lighting conditions (shadows, glare, overcast) remain stable.
 """
 
 import cv2
 import numpy as np
 
 # (name, hsv_lower, hsv_upper)
-# Red occupies both ends of the HSV hue circle, so two ranges are needed.
+# Ranges tuned for real Indian road footage under mixed lighting.
+# Red wraps the HSV hue circle so two ranges are required.
+# White / Silver / Black use only Saturation + Value (hue-independent).
 _COLOR_RANGES: list[tuple[str, tuple, tuple]] = [
-    ("White",   (  0,   0, 185), (180,  35, 255)),
-    ("Black",   (  0,   0,   0), (180, 255,  50)),
-    ("Silver",  (  0,   0,  55), (180,  35, 185)),
-    ("Red",     (  0, 110,  80), ( 10, 255, 255)),
-    ("Red",     (170, 110,  80), (180, 255, 255)),
-    ("Orange",  ( 11,  90,  90), ( 25, 255, 255)),
-    ("Yellow",  ( 26,  90,  90), ( 34, 255, 255)),
-    ("Green",   ( 35,  80,  80), ( 85, 255, 255)),
-    ("Blue",    ( 86,  80,  80), (130, 255, 255)),
-    ("Purple",  (131,  80,  80), (160, 255, 255)),
-    ("Brown",   ( 10, 100,  20), ( 20, 200, 150)),
+    # Achromatic colours — hue is irrelevant, only S and V matter.
+    ("White",   (  0,   0, 180), (180,  40, 255)),  # bright & desaturated
+    ("Black",   (  0,   0,   0), (180, 255,  55)),  # very dark
+    ("Silver",  (  0,   0,  56), (180,  40, 179)),  # mid-brightness, desaturated
+
+    # Chromatic colours — tight hue bands + minimum saturation & brightness.
+    ("Red",     (  0, 120,  70), ( 10, 255, 255)),  # lower hue red
+    ("Red",     (165, 120,  70), (180, 255, 255)),  # upper hue red (wrap)
+    ("Orange",  ( 11, 120,  80), ( 22, 255, 255)),
+    ("Yellow",  ( 23, 120, 100), ( 35, 255, 255)),
+    ("Green",   ( 36,  80,  50), ( 85, 255, 255)),
+    ("Blue",    ( 86,  90,  50), (130, 255, 255)),
+    ("Purple",  (131,  70,  50), (165, 255, 255)),
+    ("Brown",   ( 10, 100,  30), ( 22, 210, 140)),
 ]
 
 # ROI crop margins as fractions of bounding-box height / width.
 # Skipping the roof (top) and tyres/road (bottom) isolates the
 # painted body panels where the true vehicle colour is visible.
-_ROI_TOP_MARGIN: float = 0.15
-_ROI_BOTTOM_MARGIN: float = 0.30
-_ROI_SIDE_MARGIN: float = 0.08
+_ROI_TOP_MARGIN: float    = 0.18   # skip roof / windscreen reflection
+_ROI_BOTTOM_MARGIN: float = 0.28   # skip tyres, road surface
+_ROI_SIDE_MARGIN: float   = 0.10   # skip shadow edges
 
 # Reject ROIs too small for reliable colour statistics.
-_MIN_ROI_SIZE: int = 4
+_MIN_ROI_SIZE: int = 8
 
 # Minimum fraction of ROI pixels that must match a colour before
 # it is accepted; prevents noise from dominating the result.
-_MIN_COVERAGE: float = 0.08
+_MIN_COVERAGE: float = 0.12
+
+# CLAHE parameters for Value-channel lighting normalisation.
+_CLAHE_CLIP: float    = 2.0
+_CLAHE_TILE: tuple    = (4, 4)
 
 
 def detect_vehicle_color(frame: np.ndarray, bbox: tuple) -> str:
     """Return the dominant colour name of the vehicle inside *bbox*.
+
+    Applies CLAHE on the HSV Value channel before range matching so
+    that detections remain stable across varying lighting conditions
+    (shadows, direct sunlight, overcast sky).
 
     Args:
         frame (np.ndarray): Full BGR image from the video frame.
@@ -81,16 +98,24 @@ def detect_vehicle_color(frame: np.ndarray, bbox: tuple) -> str:
     ):
         return "Unknown"
 
+    # Convert to HSV then apply CLAHE on the Value channel only.
+    # This normalises brightness without altering hue or saturation,
+    # making colour matching robust to shadows and glare.
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=_CLAHE_CLIP, tileGridSize=_CLAHE_TILE)
+    v_eq = clahe.apply(v)
+    hsv_eq = cv2.merge([h, s, v_eq])
+
     total = roi.shape[0] * roi.shape[1]
 
     scores: dict[str, int] = {}
     for name, lo, hi in _COLOR_RANGES:
         mask = cv2.inRange(
-            hsv, np.array(lo, np.uint8), np.array(hi, np.uint8)
+            hsv_eq, np.array(lo, np.uint8), np.array(hi, np.uint8)
         )
         cnt = int(cv2.countNonZero(mask))
-        # Both "Red" entries map to the same key so their pixel counts merge.
+        # Both "Red" entries map to the same key so their counts merge.
         scores[name] = scores.get(name, 0) + cnt
 
     best = max(scores, key=scores.get)

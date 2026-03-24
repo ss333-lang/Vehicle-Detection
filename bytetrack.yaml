@@ -1,7 +1,7 @@
 tracker_type: bytetrack
-track_high_thresh: 0.20
-track_low_thresh: 0.05
-new_track_thresh: 0.20
-track_buffer: 60
-match_thresh: 0.8
-fuse_score: True
+track_high_thresh: 0.15      # min conf for high-quality detection association
+track_low_thresh: 0.05       # min conf to even consider a detection
+new_track_thresh: 0.15       # min conf to start a new track
+track_buffer: 90             # frames to keep a lost track alive (~3.6 s at 25 fps)
+match_thresh: 0.70           # IoU match threshold; lower = fewer ID switches
+fuse_score: True             # fuse detection score into track score

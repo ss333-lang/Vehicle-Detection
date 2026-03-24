@@ -1,12 +1,12 @@
 tracker_type: botsort
-track_high_thresh: 0.20
-track_low_thresh: 0.05
-new_track_thresh: 0.20
-track_buffer: 60
-match_thresh: 0.8
-fuse_score: True
-gmc_method: sparseOptFlow
-proximity_thresh: 0.5
-appearance_thresh: 0.8
-with_reid: False
+track_high_thresh: 0.15      # min conf for high-quality detection association
+track_low_thresh: 0.05       # min conf to even consider a detection
+new_track_thresh: 0.15       # min conf to start a new track
+track_buffer: 50             # frames to keep a lost track alive (~2 s at 25 fps)
+match_thresh: 0.75           # IoU match threshold; lower = fewer ID switches
+fuse_score: True             # fuse detection score into track score
+gmc_method: sparseOptFlow    # global motion compensation for camera movement
+proximity_thresh: 0.4        # spatial distance gate for association
+appearance_thresh: 0.6       # appearance similarity threshold (lower = more matches)
+with_reid: True             # enable appearance Re-ID to reduce ID switches
 model: auto

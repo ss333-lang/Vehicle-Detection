@@ -25,23 +25,23 @@ _PROJECT_ROOT: pathlib.Path = pathlib.Path(__file__).resolve().parent
 DATASET_DIR: pathlib.Path = (
     _PROJECT_ROOT / "Indian Vehicle Classification.v3i.yolov11"
 )
-WEIGHTS_PATH: pathlib.Path = _PROJECT_ROOT / "last.pt"
+WEIGHTS_PATH: pathlib.Path = _PROJECT_ROOT / "yolo11m.pt"  # official pretrained base
 FIXED_YAML: pathlib.Path = _PROJECT_ROOT / "data_train.yaml"
 RUNS_DIR: pathlib.Path = _PROJECT_ROOT / "runs"
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 
-EPOCHS: int = 50
+EPOCHS: int = 200        # Enough epochs for YOLOv11m to converge on custom data.
 IMG_SIZE: int = 640
 BATCH_SIZE: int = 16
-PATIENCE: int = 15       # Early-stop if val mAP stalls for this many epochs.
+PATIENCE: int = 30       # Early-stop if val mAP stalls for this many epochs.
 WORKERS: int = 4
 LR0: float = 0.01        # Initial learning rate.
 LRF: float = 0.01        # Final lr as a fraction of LR0.
 MOMENTUM: float = 0.937
 WEIGHT_DECAY: float = 5e-4
 WARMUP_EPOCHS: int = 3
-RUN_NAME: str = "vehicle_detection_v1"
+RUN_NAME: str = "vehicle_detection_v2"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ def main() -> None:
         project=str(RUNS_DIR),
         name=RUN_NAME,
         exist_ok=True,
-        resume=True,     # Resume from last.pt checkpoint.
+        resume=False,
         optimizer="auto",
         lr0=LR0,
         lrf=LRF,
@@ -131,6 +131,17 @@ def main() -> None:
         plots=True,
         verbose=True,
         half=True,
+        # Augmentation tuned for dense Indian traffic scenes.
+        mosaic=1.0,        # Tile 4 images — critical for overlapping vehicles.
+        mixup=0.1,         # Blend two images — helps with occlusion.
+        copy_paste=0.1,    # Copy-paste vehicles across scenes.
+        degrees=5.0,       # Slight rotation for camera tilt variation.
+        translate=0.1,     # Random translation.
+        scale=0.5,         # Scale jitter for near/far vehicles.
+        hsv_h=0.015,       # Hue jitter.
+        hsv_s=0.7,         # Saturation jitter — handles shadow/sunlight.
+        hsv_v=0.4,         # Value jitter — handles overcast/bright days.
+        fliplr=0.5,        # Horizontal flip.
     )
 
     best_weights = pathlib.Path(results.save_dir) / "weights" / "best.pt"

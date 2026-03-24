@@ -15,8 +15,8 @@ class TestVehicleClasses:
     """Tests for VEHICLE_CLASSES and CLASS_COLORS constants."""
 
     def test_car_is_defined(self) -> None:
-        assert 2 in VEHICLE_CLASSES
-        assert VEHICLE_CLASSES[2] == "car"
+        assert 3 in VEHICLE_CLASSES
+        assert VEHICLE_CLASSES[3] == "Car"
 
     def test_all_classes_have_box_color(self) -> None:
         # Every detected class must have a corresponding render colour.

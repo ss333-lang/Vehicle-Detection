@@ -175,10 +175,10 @@ with st.sidebar:
 
     st.markdown("### Detection")
     conf = st.slider(
-        "Confidence threshold", 0.10, 0.95, 0.25, 0.05, key="conf"
+        "Confidence threshold", 0.05, 0.95, 0.15, 0.05, key="conf"
     )
     iou = st.slider(
-        "IoU threshold", 0.10, 0.95, 0.45, 0.05, key="iou"
+        "IoU threshold", 0.10, 0.95, 0.60, 0.05, key="iou"
     )
     st.divider()
 
@@ -190,6 +190,40 @@ with st.sidebar:
     st.markdown("### Options")
     detect_colors = st.toggle("Color Detection", value=True)
     show_labels = st.toggle("Show Labels", value=True)
+    augment = st.toggle("Augment (better distant detection)", value=False)
+    frame_skip = st.slider(
+        "Frame Skip (real-time speed)", 1, 10, 1,
+        help="Run detection every N frames. Use 1 for smooth tracking. Increase on slow hardware.",
+    )
+    st.divider()
+
+    st.markdown("### Counting Line")
+    line_enabled = st.toggle("Enable Counting Line", value=False)
+    line_position = st.slider(
+        "Line Position (% from top)", 10, 90, 50,
+        help="Horizontal line position. Vehicles crossing this line are counted. Only vehicles below this line are detected.",
+        disabled=not line_enabled,
+    )
+    line_y = line_position / 100.0 if line_enabled else None
+    count_direction = st.radio(
+        "Count Direction",
+        ["down", "up", "both"],
+        index=0,
+        help="down: vehicles moving top→bottom  |  up: bottom→top  |  both: either",
+        disabled=not line_enabled,
+        horizontal=True,
+    )
+
+    # When the counting line is active, use its position as the ROI top
+    # so only vehicles below (in front of) the line are detected.
+    if line_enabled:
+        roi_top = line_position / 100.0
+    else:
+        roi_top_pct = st.slider(
+            "Mask top % (ignore sky/bridge)", 0, 60, 0,
+            help="Black out the top N% of the frame before detection.",
+        )
+        roi_top = roi_top_pct / 100.0
     st.divider()
 
     st.markdown("### Vehicle Types")
@@ -248,7 +282,7 @@ with tab_batch:
 
     uploaded_batch = st.file_uploader(
         "Choose a video file",
-        type=["mp4", "avi", "mov", "mkv"],
+        type=["mp4", "avi", "mov", "mkv", "webm"],
         key="batch_file",
     )
 
@@ -347,7 +381,7 @@ with tab_rt:
 
     uploaded_rt = st.file_uploader(
         "Choose a video file",
-        type=["mp4", "avi", "mov", "mkv"],
+        type=["mp4", "avi", "mov", "mkv", "webm"],
         key="rt_file",
     )
 
@@ -385,6 +419,12 @@ with tab_rt:
                     classes=selected_ids,
                     detect_colors=detect_colors,
                     show_labels=show_labels,
+                    frame_skip=frame_skip,
+                    augment=augment,
+                    line_y=line_y,
+                    imgsz=640,
+                    roi_top=roi_top,
+                    count_direction=count_direction,
                 )
 
                 for rgb, stats, fn, total_f, fps in streamer:
@@ -416,6 +456,11 @@ with tab_rt:
                             "Unique Tracks",
                             len(rt_cum["unique_tracks"]),
                         )
+                        if line_enabled:
+                            st.metric(
+                                "Line Crossings",
+                                stats.get("line_crossings", 0),
+                            )
                         if stats["classes"]:
                             st.markdown("**Types**")
                             for cls, cnt in stats["classes"].items():
