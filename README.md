@@ -11,7 +11,7 @@ pip install -e ".[dev]"
 ## Run
 
 ```bash
-streamlit run src/vehicle_detection/app.py
+PYTHONPATH=src streamlit run src/vehicle_detection/app.py
 ```
 
 ## Test
@@ -31,6 +31,8 @@ Vehicle_Detection/
 │       └── utils/
 │           ├── color_detection.py
 │           └── video_processor.py
+├── models/
+│   └── best.pt             # Trained YOLOv11m weights (9 classes)
 ├── tests/
 │   └── test_utils.py
 ├── temp/                   # Runtime temp files (git-ignored)
