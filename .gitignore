@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+src/*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+
+# Streamlit runtime temp files
+temp/
+
+# Training outputs (weights, plots, metrics)
+runs/
+
+# Auto-generated corrected data yaml
+data_train.yaml
+
+# YOLO model weights (large binaries — downloaded automatically on first run)
+*.pt
+*.onnx
+# But keep our trained model
+!models/best.pt
+
+# Dataset files (too large for git)
+*.zip
+Indian Vehicle Classification.v3i.yolov11/
+Indian Vehicle Classification.v3i.yolov11_labels_backup/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Test / coverage artefacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage

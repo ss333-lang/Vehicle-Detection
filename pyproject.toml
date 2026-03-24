@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vehicle-detection"
+version = "0.1.0"
+description = "YOLOv11m vehicle detection with ByteSORT / BoT-SORT tracking"
+requires-python = ">=3.10"
+dependencies = [
+    "ultralytics>=8.3.0",
+    "streamlit>=1.40.0",
+    "opencv-python-headless>=4.8.0",
+    "numpy>=1.24.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# ── Ruff (linter + formatter) ──────────────────────────────────────────────────
+[tool.ruff]
+line-length = 79
+select = ["E", "F", "I", "UP", "B"]
+
+# ── Mypy (static type checker) ─────────────────────────────────────────────────
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+
+# ── Pytest ─────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
