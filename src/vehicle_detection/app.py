@@ -8,6 +8,7 @@ Provides two processing modes:
   detection, tracking, and colour recognition run on it.
 """
 
+import json
 import os
 import pathlib
 import subprocess
@@ -191,10 +192,23 @@ with st.sidebar:
     detect_colors = st.toggle("Color Detection", value=True)
     show_labels = st.toggle("Show Labels", value=True)
     augment = st.toggle("Augment (better distant detection)", value=False)
+    show_trails = st.toggle("Show Track Trails", value=True)
     frame_skip = st.slider(
         "Frame Skip (real-time speed)", 1, 10, 1,
         help="Run detection every N frames. Use 1 for smooth tracking. Increase on slow hardware.",
     )
+    st.divider()
+
+    st.markdown("### Speed Estimation")
+    speed_enabled = st.toggle("Estimate Speed (KPH)", value=False)
+    meters_per_pixel = st.slider(
+        "Scale Factor (m/px)", 0.01, 0.20, 0.05, 0.005,
+        help="Metres per pixel. Requires camera calibration for accuracy. "
+             "Default 0.05 is a rough estimate for a typical traffic camera.",
+        disabled=not speed_enabled,
+    )
+    if not speed_enabled:
+        meters_per_pixel = 0.0
     st.divider()
 
     st.markdown("### Counting Line")
@@ -314,6 +328,8 @@ with tab_batch:
                     classes=selected_ids,
                     detect_colors=detect_colors,
                     show_labels=show_labels,
+                    meters_per_pixel=meters_per_pixel,
+                    show_trails=show_trails,
                 )
 
                 for rgb, cum, fn, total_f, fps in processor:
@@ -342,6 +358,23 @@ with tab_batch:
 
                 progress_bar.progress(1.0, text="Processing complete!")
                 preview_ph.empty()
+
+                # ── JSON detection export ───────────────────────────────────
+                all_detections = cum_stats.get("all_detections", [])
+                if all_detections:
+                    json_payload = {
+                        "total_frames_processed": fn,
+                        "unique_vehicles_tracked": len(
+                            cum_stats.get("unique_tracks", set())
+                        ),
+                        "detections": all_detections,
+                    }
+                    st.download_button(
+                        label="⬇️  Download Detection JSON",
+                        data=json.dumps(json_payload, indent=2),
+                        file_name="vehicle_detections.json",
+                        mime="application/json",
+                    )
 
                 st.subheader("Summary")
                 render_stats(
@@ -425,6 +458,8 @@ with tab_rt:
                     imgsz=640,
                     roi_top=roi_top,
                     count_direction=count_direction,
+                    meters_per_pixel=meters_per_pixel,
+                    show_trails=show_trails,
                 )
 
                 for rgb, stats, fn, total_f, fps in streamer:
@@ -471,6 +506,19 @@ with tab_rt:
                                 stats["colors"].items()
                             )[:4]:
                                 st.metric(color, cnt)
+                        vehicles_with_speed = [
+                            v for v in stats.get("detected_vehicles", [])
+                            if v.get("speed_info") is not None
+                        ]
+                        if vehicles_with_speed:
+                            st.markdown("**Speed**")
+                            for v in vehicles_with_speed[:4]:
+                                si = v["speed_info"]
+                                st.metric(
+                                    f"#{v['vehicle_id']} {v['vehicle_type']}",
+                                    f"{si['kph']:.0f} km/h",
+                                    help=f"{si['direction_label']} · reliability {si['reliability']}",
+                                )
 
                     rt_progress.progress(
                         fn / max(total_f, 1),

@@ -1,11 +1,13 @@
 """Video processing pipeline.
 
-Combines YOLO11m object detection with ByteTrack / BoT-SORT tracking
-and optional per-vehicle colour detection into a single generator-based
-pipeline that supports both batch output and real-time frame streaming.
+Combines YOLO11m object detection with ByteTrack / BoT-SORT tracking,
+optional per-vehicle colour detection, speed estimation (KPH), track
+trail visualisation, and structured JSON output into a single
+generator-based pipeline that supports both batch output and real-time
+frame streaming.
 """
 
-import pathlib
+import math
 import time
 from collections import Counter
 from typing import Generator
@@ -61,10 +63,16 @@ _FPS_EPSILON: float = 1e-6
 _DEFAULT_FPS: float = 25.0
 
 # OpenCV text rendering parameters for detection labels.
-_LABEL_FONT_SCALE: float = 0.48
-_LABEL_THICKNESS: int = 1
-_LABEL_PAD_H: int = 4   # Horizontal padding inside label background.
-_LABEL_PAD_V: int = 6   # Vertical clearance above the bounding box.
+_LABEL_FONT_SCALE: float = 0.62
+_LABEL_THICKNESS: int = 2
+_LABEL_PAD_H: int = 6
+_LABEL_PAD_V: int = 8
+
+# 8-directional labels indexed clockwise from East (Right).
+_DIRECTION_LABELS: list[str] = [
+    "Right", "Bottom-Right", "Bottom", "Bottom-Left",
+    "Left", "Top-Left", "Top", "Top-Right",
+]
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -76,15 +84,7 @@ def _draw_label(
     y1: int,
     color: tuple,
 ) -> None:
-    """Draw a filled label box with white text above a bounding-box corner.
-
-    Args:
-        img (np.ndarray): BGR image to draw onto (modified in place).
-        text (str): Label string to render.
-        x1 (int): Left x-coordinate of the bounding box.
-        y1 (int): Top y-coordinate of the bounding box.
-        color (tuple): BGR fill colour for the label background.
-    """
+    """Draw a filled label box with white text above a bounding-box corner."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), _ = cv2.getTextSize(
         text, font, _LABEL_FONT_SCALE, _LABEL_THICKNESS
@@ -103,53 +103,52 @@ def _draw_label(
     )
 
 
+def _direction_label(angle_rad: float) -> str:
+    """Map an atan2 angle in radians to one of 8 compass direction labels."""
+    angle_deg = math.degrees(angle_rad) % 360
+    idx = round(angle_deg / 45) % 8
+    return _DIRECTION_LABELS[idx]
+
+
 # ── Public class ──────────────────────────────────────────────────────────────
 
 class VehicleDetector:
-    """YOLO11m detector with ByteTrack / BoT-SORT and colour recognition.
+    """YOLO11m detector with ByteTrack / BoT-SORT, colour recognition,
+    speed estimation (KPH), and track trail visualisation.
 
     Args:
         model_path (str): Path to YOLO weights. Defaults to
-            ``"yolo11m.pt"``, which ultralytics downloads automatically.
+            ``"models/best.pt"``.
     """
 
     def __init__(self, model_path: str = "models/best.pt") -> None:
-        # Prefer ONNX over .pt for ~2-3x faster CPU inference.
-        # Export is done once automatically if ONNX does not yet exist.
-        pt_path = pathlib.Path(model_path)
-        onnx_path = pt_path.with_suffix(".onnx")
-        if onnx_path.exists():
-            self.model = YOLO(str(onnx_path), task="detect")
-        else:
-            self.model = YOLO(str(pt_path), task="detect")
-            try:
-                self.model.export(format="onnx", imgsz=640, dynamic=False)
-                if onnx_path.exists():
-                    self.model = YOLO(str(onnx_path), task="detect")
-            except Exception:
-                pass  # If export fails, continue with .pt
+        import torch
+        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+        self.model = YOLO(str(model_path), task="detect")
 
         self._vehicle_positions: dict[int, float] = {}
         self._line_crossings: int = 0
-        # Majority-vote colour buffer: accumulate up to _COLOR_VOTE_FRAMES
-        # detections per track, then lock in the most common result.
-        # Prevents the first (possibly shadowed) frame from locking a wrong colour.
+        # Majority-vote colour buffer per track ID.
         self._vehicle_color_votes: dict[int, list[str]] = {}
         self._vehicle_colors: dict[int, str] = {}
-        # Smoothed bounding boxes per track: EMA keeps boxes stable as vehicles move.
+        # EMA-smoothed bounding boxes per track ID.
         self._smooth_boxes: dict[int, list[float]] = {}
-        # Track IDs already counted — prevents double-counting at the line.
+        # Track IDs already counted at the line (prevents double-counting).
         self._counted_ids: set[int] = set()
         # Last detection draw data — used to overlay boxes on skipped frames.
         self._last_draw_data: list[dict] = []
+        # Centroid history per track for speed & direction: (cx, cy, timestamp).
+        self._track_history: dict[int, list[tuple[float, float, float]]] = {}
 
-    # Number of per-track colour votes before locking in the final colour.
     _COLOR_VOTE_FRAMES: int = 5
-    # EMA smoothing factor for bounding boxes (0=frozen, 1=no smoothing).
-    _BOX_SMOOTH_ALPHA: float = 0.6
+    _BOX_SMOOTH_ALPHA: float = 0.2
+    # Max positions kept per track (mirrors sergio11's 30-point trail).
+    _TRACK_HISTORY_MAX: int = 30
+    # Minimum history points required before a speed estimate is returned.
+    _SPEED_MIN_SAMPLES: int = 3
 
     def _reset_tracker(self) -> None:
-        """Clear tracker state so track IDs restart for a new video."""
+        """Clear all tracker state so track IDs restart for a new video."""
         try:
             self.model.predictor = None
         except AttributeError:
@@ -161,6 +160,66 @@ class VehicleDetector:
         self._smooth_boxes.clear()
         self._counted_ids.clear()
         self._last_draw_data.clear()
+        self._track_history.clear()
+
+    def _compute_speed_direction(
+        self,
+        track_id: int,
+        cx: float,
+        cy: float,
+        t: float,
+        meters_per_pixel: float,
+    ) -> dict | None:
+        """Append centroid to history, then compute KPH speed and direction.
+
+        Args:
+            track_id: Unique tracker ID.
+            cx, cy: Current centroid in pixels.
+            t: Timestamp in seconds (use ``frame_number / video_fps``).
+            meters_per_pixel: Real-world scale (metres per pixel).
+
+        Returns:
+            dict with keys ``kph``, ``reliability``, ``direction_label``,
+            ``direction`` (radians), or ``None`` if history is too short.
+        """
+        history = self._track_history.setdefault(track_id, [])
+        history.append((cx, cy, t))
+        if len(history) > self._TRACK_HISTORY_MAX:
+            history.pop(0)
+
+        if len(history) < self._SPEED_MIN_SAMPLES:
+            return None
+
+        # Direction: vector from oldest to newest centroid.
+        x0, y0, _ = history[0]
+        xl, yl, _ = history[-1]
+        angle_rad = math.atan2(yl - y0, xl - x0)
+
+        # Speed: mean of per-interval pixel distances converted to m/s → KPH.
+        speeds_mps: list[float] = []
+        for i in range(1, len(history)):
+            px, py, pt = history[i]
+            qx, qy, qt = history[i - 1]
+            dt = pt - qt
+            if dt <= 0:
+                continue
+            dist_m = math.hypot(px - qx, py - qy) * meters_per_pixel
+            speeds_mps.append(dist_m / dt)
+
+        if not speeds_mps:
+            return None
+
+        kph = (sum(speeds_mps) / len(speeds_mps)) * 3.6
+
+        n = len(history)
+        reliability = 0.5 if n < 5 else (0.7 if n < 10 else 1.0)
+
+        return {
+            "kph": round(kph, 1),
+            "reliability": reliability,
+            "direction_label": _direction_label(angle_rad),
+            "direction": round(angle_rad, 4),
+        }
 
     def process_frame(
         self,
@@ -176,39 +235,44 @@ class VehicleDetector:
         imgsz: int = 1280,
         roi_top: float = 0.0,
         count_direction: str = "down",
+        meters_per_pixel: float = 0.05,
+        show_trails: bool = True,
+        frame_time: float | None = None,
     ) -> tuple[np.ndarray, dict]:
-        """Run detection, tracking, and optional colour detection on *frame*.
+        """Run detection, tracking, colour detection, and speed estimation on *frame*.
 
         Args:
-            frame (np.ndarray): BGR image from the video capture.
-            tracker_yaml (str): Tracker config filename, e.g.
-                ``"bytetrack.yaml"`` or ``"botsort.yaml"``.
-            conf (float): Minimum detection confidence threshold.
-            iou (float): IoU threshold for non-maximum suppression.
-            classes (list[int] | None): COCO class IDs to detect.
-                Defaults to all entries in ``VEHICLE_CLASSES``.
-            detect_colors (bool): Run per-vehicle colour detection when
-                ``True``.
-            show_labels (bool): Draw text labels on the annotated frame
-                when ``True``.
+            frame: BGR image from the video capture.
+            tracker_yaml: Tracker config filename.
+            conf: Minimum detection confidence threshold.
+            iou: IoU threshold for non-maximum suppression.
+            classes: Class IDs to detect. Defaults to all VEHICLE_CLASSES.
+            detect_colors: Run per-vehicle colour detection when True.
+            show_labels: Draw text labels on the annotated frame when True.
+            augment: Use test-time augmentation for distant detection.
+            line_y: Counting line position as fraction of frame height (0–1).
+            imgsz: Inference image size in pixels.
+            roi_top: Fraction of frame top to mask out (0–1).
+            count_direction: "down", "up", or "both" for counting line.
+            meters_per_pixel: Real-world scale (m/px) for speed estimation.
+                Requires camera calibration for accuracy. Default 0.05 is a
+                rough estimate for a typical traffic camera.
+            show_trails: Draw 30-point centroid trail polylines when True.
+            frame_time: Timestamp for this frame in seconds. Pass
+                ``frame_number / video_fps`` for accurate speed in batch mode.
+                Falls back to ``time.time()`` when None.
 
         Returns:
-            tuple: A pair ``(annotated_bgr, stats)`` where:
-
-                - ``annotated_bgr`` (np.ndarray): Frame with bounding
-                  boxes and labels drawn (BGR colour space).
-                - ``stats`` (dict): Keys are ``total`` (int),
-                  ``classes`` (dict[str, int]),
-                  ``colors`` (dict[str, int]),
-                  ``track_ids`` (list[int]).
+            tuple: ``(annotated_bgr, stats)`` where stats includes
+                ``detected_vehicles`` (list of per-vehicle JSON dicts).
         """
         if classes is None:
             classes = list(VEHICLE_CLASSES.keys())
 
+        t_now = frame_time if frame_time is not None else time.time()
         fh, fw = frame.shape[:2]
 
-        # Apply ROI mask: black out the top fraction of the frame so YOLO
-        # never detects vehicles on overhead bridges or in the background.
+        # Black out the top fraction of the frame before YOLO inference.
         if roi_top > 0.0:
             inference_frame = frame.copy()
             mask_h = int(fh * roi_top)
@@ -225,12 +289,18 @@ class VehicleDetector:
             classes=classes,
             imgsz=imgsz,
             augment=augment,
+            device=self.device,
+            half=False,
             verbose=False,
         )
 
         stats: dict = {
-            "total": 0, "classes": {}, "colors": {}, "track_ids": [],
+            "total": 0,
+            "classes": {},
+            "colors": {},
+            "track_ids": [],
             "line_crossings": self._line_crossings,
+            "detected_vehicles": [],
         }
         annotated = frame.copy()
 
@@ -239,25 +309,24 @@ class VehicleDetector:
             mask_h = int(fh * roi_top)
             cv2.line(annotated, (0, mask_h), (fw, mask_h), (80, 80, 80), 1)
 
-        # Precompute line pixel position for crossing detection.
         line_px: int | None = int(line_y * fh) if line_y is not None else None
 
         self._last_draw_data.clear()
 
         if results and results[0].boxes is not None:
             for box in results[0].boxes:
-                cls_id = int(box.cls[0])
+                cls_id   = int(box.cls[0])
                 conf_val = float(box.conf[0])
-                xyxy = box.xyxy[0].cpu().numpy()
+                xyxy     = box.xyxy[0].cpu().numpy()
                 track_id = int(box.id[0]) if box.id is not None else -1
 
-                cls_name = VEHICLE_CLASSES.get(cls_id, "unknown")
+                cls_name  = VEHICLE_CLASSES.get(cls_id, "unknown")
                 box_color = CLASS_COLORS.get(cls_name, CLASS_COLORS["unknown"])
 
+                # ── Colour detection ────────────────────────────────────────
                 v_color = "N/A"
                 if detect_colors:
                     if track_id >= 0 and track_id in self._vehicle_colors:
-                        # Colour already locked in by majority vote.
                         v_color = self._vehicle_colors[track_id]
                     else:
                         raw = detect_vehicle_color(frame, xyxy)
@@ -265,17 +334,14 @@ class VehicleDetector:
                             votes = self._vehicle_color_votes.setdefault(track_id, [])
                             votes.append(raw)
                             if len(votes) >= self._COLOR_VOTE_FRAMES:
-                                # Lock in the majority colour across the vote window.
                                 winner = Counter(votes).most_common(1)[0][0]
                                 self._vehicle_colors[track_id] = winner
                                 v_color = winner
                             else:
-                                # Still collecting votes; show current best guess.
                                 v_color = Counter(votes).most_common(1)[0][0]
                         else:
                             v_color = raw
 
-                # Accumulate per-frame statistics.
                 stats["total"] += 1
                 cls_counts = stats["classes"]
                 cls_counts[cls_name] = cls_counts.get(cls_name, 0) + 1
@@ -286,8 +352,8 @@ class VehicleDetector:
 
                 x1, y1, x2, y2 = map(int, xyxy)
 
-                # Tighten box: shrink each side by 3 % of box dimensions
-                # to remove the Kalman-filter prediction padding.
+                # ── Bounding box refinement ─────────────────────────────────
+                # Shrink 3 % per side to remove Kalman-filter padding.
                 _bw = x2 - x1
                 _bh = y2 - y1
                 _pad = 0.03
@@ -296,9 +362,7 @@ class VehicleDetector:
                 x2 = int(x2 - _bw * _pad)
                 y2 = int(y2 - _bh * _pad)
 
-                # Cap box size: Kalman filter can produce unrealistically large
-                # predicted boxes for fast-moving or partially-visible vehicles.
-                # Clamp each dimension to 35 % of the frame to prevent this.
+                # Cap to 35 % of frame to prevent unrealistically large boxes.
                 _max_w = int(fw * 0.35)
                 _max_h = int(fh * 0.35)
                 _cx = (x1 + x2) // 2
@@ -310,8 +374,7 @@ class VehicleDetector:
                 x2 = _cx + _bw // 2
                 y2 = _cy + _bh // 2
 
-                # EMA box smoothing: blend current box with previous smoothed box
-                # so the rectangle adapts gradually rather than jumping each frame.
+                # ── EMA box smoothing ───────────────────────────────────────
                 if track_id >= 0:
                     raw_box = [float(x1), float(y1), float(x2), float(y2)]
                     if track_id in self._smooth_boxes:
@@ -323,13 +386,33 @@ class VehicleDetector:
                     self._smooth_boxes[track_id] = smoothed
                     x1, y1, x2, y2 = (int(v) for v in smoothed)
 
-                # Line crossing detection using track centre Y.
+                # ── Speed & direction estimation ────────────────────────────
+                cx_f = (x1 + x2) / 2.0
+                cy_f = (y1 + y2) / 2.0
+                speed_info: dict | None = None
+                if track_id >= 0:
+                    speed_info = self._compute_speed_direction(
+                        track_id, cx_f, cy_f, t_now, meters_per_pixel
+                    )
+
+                # ── Track history trail (30-point polyline) ─────────────────
+                if show_trails and track_id >= 0 and track_id in self._track_history:
+                    history = self._track_history[track_id]
+                    if len(history) >= 2:
+                        pts = np.array(
+                            [(int(h[0]), int(h[1])) for h in history],
+                            dtype=np.int32,
+                        )
+                        cv2.polylines(
+                            annotated, [pts], False, box_color, 2, cv2.LINE_AA
+                        )
+
+                # ── Line crossing detection ─────────────────────────────────
                 if line_px is not None and track_id >= 0:
-                    center_y = (y1 + y2) / 2.0
                     prev_y = self._vehicle_positions.get(track_id)
                     if prev_y is not None and track_id not in self._counted_ids:
-                        went_down = prev_y < line_px <= center_y
-                        went_up   = prev_y > line_px >= center_y
+                        went_down = prev_y < line_px <= cy_f
+                        went_up   = prev_y > line_px >= cy_f
                         crossed = (
                             (count_direction == "down" and went_down) or
                             (count_direction == "up"   and went_up)   or
@@ -339,34 +422,53 @@ class VehicleDetector:
                             self._counted_ids.add(track_id)
                             self._line_crossings += 1
                             stats["line_crossings"] = self._line_crossings
-                    self._vehicle_positions[track_id] = center_y
+                    self._vehicle_positions[track_id] = cy_f
 
                 if track_id >= 0:
                     stats["track_ids"].append(track_id)
 
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
 
+                # ── Label (type · conf · colour · KPH) ─────────────────────
                 label = ""
                 if show_labels:
-                    id_part = f"#{track_id} " if track_id >= 0 else ""
+                    id_part    = f"#{track_id} " if track_id >= 0 else ""
                     color_part = (
-                        f" | {v_color}"
-                        if v_color not in ("N/A", "Unknown")
-                        else ""
+                        f" | {v_color}" if v_color not in ("N/A", "Unknown") else ""
+                    )
+                    speed_part = (
+                        f" | {speed_info['kph']:.0f} km/h"
+                        if speed_info is not None else ""
                     )
                     label = (
                         f"{id_part}{cls_name.upper()}"
-                        f" {conf_val:.2f}{color_part}"
+                        f" {conf_val:.2f}{color_part}{speed_part}"
                     )
                     _draw_label(annotated, label, x1, y1, box_color)
 
-                # Store box info so skipped frames can re-draw on the live frame.
+                # ── Structured JSON record for this vehicle ─────────────────
+                vehicle_record: dict = {
+                    "vehicle_id": track_id,
+                    "vehicle_type": cls_name,
+                    "detection_confidence": round(conf_val, 4),
+                    "color": v_color,
+                    "speed_info": speed_info,
+                    "vehicle_coordinates": {
+                        "x": int(cx_f),
+                        "y": int(cy_f),
+                        "width":  x2 - x1,
+                        "height": y2 - y1,
+                    },
+                }
+                stats["detected_vehicles"].append(vehicle_record)
+
                 self._last_draw_data.append({
                     "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                     "box_color": box_color, "label": label,
+                    "track_id": track_id,
                 })
 
-        # Draw counting line over all bounding boxes.
+        # ── Counting line overlay ───────────────────────────────────────────
         if line_px is not None:
             cv2.line(annotated, (0, line_px), (fw, line_px), (0, 255, 255), 3)
             count_label = f"Count: {self._line_crossings}"
@@ -390,13 +492,23 @@ class VehicleDetector:
         line_px: int | None,
         show_labels: bool,
         roi_top: float,
+        show_trails: bool = True,
     ) -> np.ndarray:
-        """Draw last known boxes onto *frame* for smooth skipped-frame display."""
+        """Draw last known boxes and trails onto *frame* for smooth skipped-frame display."""
         fh, fw = frame.shape[:2]
         out = frame.copy()
         if roi_top > 0.0:
             cv2.line(out, (0, int(fh * roi_top)), (fw, int(fh * roi_top)), (80, 80, 80), 1)
         for d in self._last_draw_data:
+            tid = d.get("track_id", -1)
+            if show_trails and tid >= 0 and tid in self._track_history:
+                history = self._track_history[tid]
+                if len(history) >= 2:
+                    pts = np.array(
+                        [(int(h[0]), int(h[1])) for h in history],
+                        dtype=np.int32,
+                    )
+                    cv2.polylines(out, [pts], False, d["box_color"], 2, cv2.LINE_AA)
             cv2.rectangle(out, (d["x1"], d["y1"]), (d["x2"], d["y2"]), d["box_color"], 2)
             if show_labels and d["label"]:
                 _draw_label(out, d["label"], d["x1"], d["y1"], d["box_color"])
@@ -424,31 +536,26 @@ class VehicleDetector:
         imgsz: int = 640,
         roi_top: float = 0.0,
         count_direction: str = "down",
+        meters_per_pixel: float = 0.05,
+        show_trails: bool = True,
     ) -> Generator[tuple, None, None]:
         """Yield processed frames for real-time display in Streamlit.
 
-        Runs detection on every frame for smooth tracking. Display is
-        throttled to the video's native FPS so playback feels normal.
-        ``frame_skip`` skips detection on intermediate frames on very
-        slow hardware, trading tracking smoothness for speed.
-
         Yields:
             tuple: ``(rgb_frame, stats, frame_num, total_frames, fps)``
-                where ``rgb_frame`` is ready for ``st.image()``.
         """
         self._reset_tracker()
 
         cap = cv2.VideoCapture(video_path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         src_fps = cap.get(cv2.CAP_PROP_FPS) or _DEFAULT_FPS
-        # Minimum wall-clock interval per frame to match native video speed.
         min_interval = 1.0 / src_fps
 
         fn = 0
         last_annotated: np.ndarray | None = None
         last_stats: dict = {
             "total": 0, "classes": {}, "colors": {},
-            "track_ids": [], "line_crossings": 0,
+            "track_ids": [], "line_crossings": 0, "detected_vehicles": [],
         }
 
         try:
@@ -458,26 +565,27 @@ class VehicleDetector:
                 if not ret:
                     break
                 fn += 1
+                frame_time = fn / src_fps
 
                 if fn % max(frame_skip, 1) == 1 or frame_skip <= 1 or last_annotated is None:
                     annotated, stats = self.process_frame(
                         frame, tracker_yaml, conf, iou,
                         classes, detect_colors, show_labels,
                         augment, line_y, imgsz, roi_top, count_direction,
+                        meters_per_pixel, show_trails, frame_time,
                     )
                     last_annotated = annotated
                     last_stats = stats
                 else:
-                    # Overlay last known boxes on the CURRENT raw frame so the
-                    # background video plays smoothly while detection catches up.
                     line_px = int(line_y * frame.shape[0]) if line_y is not None else None
-                    annotated = self._overlay_last_boxes(frame, line_px, show_labels, roi_top)
+                    annotated = self._overlay_last_boxes(
+                        frame, line_px, show_labels, roi_top, show_trails
+                    )
                     stats = last_stats
 
                 elapsed = time.perf_counter() - frame_start
                 fps = 1.0 / max(elapsed, _FPS_EPSILON)
 
-                # Throttle to native video FPS when processing is faster.
                 remaining = min_interval - elapsed
                 if remaining > 0:
                     time.sleep(remaining)
@@ -498,32 +606,23 @@ class VehicleDetector:
         detect_colors: bool = True,
         show_labels: bool = True,
         imgsz: int = 640,
+        meters_per_pixel: float = 0.05,
+        show_trails: bool = True,
     ) -> Generator[tuple, None, None]:
         """Process a full video, write annotated output, and yield progress.
 
-        Saves the annotated video to *output_path* while yielding cumulative
-        statistics so the caller can update a progress bar during processing.
-
-        Args:
-            input_path (str): Path to the source video file.
-            output_path (str): Destination path for the annotated MP4.
-            tracker_yaml (str): Tracker config filename.
-            conf (float): Detection confidence threshold.
-            iou (float): IoU threshold for NMS.
-            classes (list[int] | None): COCO class IDs to detect.
-            detect_colors (bool): Enable per-vehicle colour detection.
-            show_labels (bool): Draw labels on each frame.
+        Accumulates per-vehicle JSON records in ``cumulative_stats["all_detections"]``
+        so the caller can offer a JSON download after processing completes.
 
         Yields:
-            tuple: ``(rgb_frame, cumulative_stats, frame_num,
-                total_frames, fps)`` on every processed frame.
+            tuple: ``(rgb_frame, cumulative_stats, frame_num, total_frames, fps)``
         """
         self._reset_tracker()
 
         cap = cv2.VideoCapture(input_path)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         src_fps = cap.get(cv2.CAP_PROP_FPS) or _DEFAULT_FPS
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -532,7 +631,8 @@ class VehicleDetector:
         fn = 0
         t0 = time.perf_counter()
         cum: dict = {
-            "total": 0, "classes": {}, "colors": {}, "unique_tracks": set()
+            "total": 0, "classes": {}, "colors": {}, "unique_tracks": set(),
+            "all_detections": [],
         }
 
         try:
@@ -541,11 +641,15 @@ class VehicleDetector:
                 if not ret:
                     break
                 fn += 1
+                frame_time = fn / src_fps
 
                 annotated, stats = self.process_frame(
                     frame, tracker_yaml, conf, iou,
                     classes, detect_colors, show_labels,
                     imgsz=imgsz,
+                    meters_per_pixel=meters_per_pixel,
+                    show_trails=show_trails,
+                    frame_time=frame_time,
                 )
                 writer.write(annotated)
 
@@ -559,6 +663,8 @@ class VehicleDetector:
                 for k, v in stats["colors"].items():
                     cum["colors"][k] = cum["colors"].get(k, 0) + v
                 cum["unique_tracks"].update(stats["track_ids"])
+                if stats["detected_vehicles"]:
+                    cum["all_detections"].extend(stats["detected_vehicles"])
 
                 rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
                 yield rgb, cum, fn, total, fps
